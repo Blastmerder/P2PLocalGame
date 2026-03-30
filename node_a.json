@@ -1,0 +1,10 @@
+{
+  "comment": "Node A — replace peer host with Node B's real public IP",
+  "local_ip": "10.0.0.1",
+  "prefix": 24,
+  "listen_port": 5555,
+  "tap_name": "tap0",
+  "peers": [
+    { "host": "PEER_B_PUBLIC_IP", "port": 5555 }
+  ]
+}
