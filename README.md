@@ -26,7 +26,7 @@
 ```bash
 # Всё что нужно — уже в base (python, iproute2, iptables/nftables).
 # Дополнительно для тестирования broadcast / проверки связи:
-sudo pacman -S --needed python iproute2 iptables nmap
+sudo pacman -S --needed python iproute2 iptables ethtool nmap
 
 # Модуль tun обычно уже загружен, на всякий случай:
 sudo modprobe tun
@@ -202,7 +202,35 @@ sudo tcpdump -i tap0 -n
 # Идёт ли VPN-трафик по UDP наружу:
 sudo tcpdump -i any -n udp port 5555
 
+# Проверить что segmentation offload реально выключен:
+ethtool -k tap0 | grep -E 'tcp-seg|gen-seg|gen-rec|large-rec'
+# всё должно быть: off [fixed] или off
+
+# Проверить что MSS-правила висят:
+sudo iptables -t mangle -L OUTPUT -v -n | grep tap0
+sudo iptables -t mangle -L INPUT  -v -n | grep tap0
+
 # Статистика пиров — смотри лог процесса main.py,
 # каждые 5 секунд печатается таблица alive/pending/dead.
+```
+
+### «Ping проходит, а всё остальное падает» — что проверить
+
+Почти всегда это MTU/offload. Код должен это отключать автоматически,
+но если нет ethtool или iptables, фикс не применится. Проверь вручную:
+
+```bash
+# 1) Отключить offload на TAP:
+sudo ethtool -K tap0 tso off gso off gro off lro off tx off sg off
+
+# 2) Зажать MSS (MTU tap0 - 40):
+sudo iptables -t mangle -A OUTPUT -o tap0 -p tcp --tcp-flags SYN,RST SYN \
+     -j TCPMSS --set-mss 1380
+sudo iptables -t mangle -A INPUT  -i tap0 -p tcp --tcp-flags SYN,RST SYN \
+     -j TCPMSS --set-mss 1380
+
+# 3) Проверить реальный рабочий размер через ping с DF-битом:
+ping -M do -s 1392 10.0.0.2   # должен пройти (1392+8 ICMP+20 IP = 1420 MTU)
+ping -M do -s 1393 10.0.0.2   # должен "Message too long" — ок, это предел
 ```
 # P2PLocalGame
