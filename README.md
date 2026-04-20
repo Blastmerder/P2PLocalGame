@@ -21,6 +21,25 @@
 - Root-права (для создания TAP-интерфейса)
 - Открытый UDP-порт (по умолчанию 5555) на файрволе
 
+## Установка на ArchLinux
+
+```bash
+# Всё что нужно — уже в base (python, iproute2, iptables/nftables).
+# Дополнительно для тестирования broadcast / проверки связи:
+sudo pacman -S --needed python iproute2 iptables nmap
+
+# Модуль tun обычно уже загружен, на всякий случай:
+sudo modprobe tun
+ls /dev/net/tun   # должен существовать
+
+# Клонируем и запускаем (root нужен для TAP + iptables):
+git clone <repo> p2pvpn && cd p2pvpn
+sudo python3 main.py --ip 10.0.0.1 --port 5555 --peer <peer_ip>:5555
+```
+
+Если используется firewalld вместо iptables — см. раздел «Файрвол» ниже.
+`nmap` даёт команду `ncat`, используемую в примерах проверки broadcast.
+
 ## Быстрый старт (2 участника)
 
 ### Участник A (публичный IP: 1.2.3.4)
@@ -40,6 +59,52 @@ sudo python3 main.py --ip 10.0.0.2 --port 5555 --peer 1.2.3.4:5555
 ```bash
 ping 10.0.0.2        # A пингует B
 ping 10.0.0.1        # B пингует A
+```
+
+### Проверка broadcast через ncat
+
+Поскольку туннель работает на уровне L2, broadcast-фреймы Ethernet
+(`ff:ff:ff:ff:ff:ff`) и IPv4-broadcast (`10.0.0.255`) прозрачно доходят
+до всех пиров — как в обычном LAN.
+
+**Unicast (точка-точка)**
+
+```bash
+# на B — слушаем UDP 4444:
+ncat -u -l -p 4444
+
+# на A — подключаемся по VPN-адресу B:
+ncat -u 10.0.0.2 4444
+# всё что набираешь на A, появляется у B
+```
+
+**Broadcast (всем сразу)**
+
+```bash
+# на B (и на всех остальных участниках) — слушаем broadcast:
+ncat -u -l -p 4444 --broadcast
+
+# на A — отправляем на subnet-broadcast:
+ncat -u --broadcast 10.0.0.255 4444
+# сообщение получат все участники, которые слушают 4444/udp
+```
+
+**TCP между клиентами (для игр / ncat chat)**
+
+```bash
+# B — TCP-listener:
+ncat -l -p 5000
+
+# A — TCP-клиент по VPN:
+ncat 10.0.0.2 5000
+```
+
+**ARP / обнаружение соседей**
+
+```bash
+# с любого узла:
+arping -I tap0 10.0.0.2       # увидим MAC пира
+ip neigh show dev tap0        # ARP-кэш VPN-интерфейса
 ```
 
 ## Через JSON-конфиг
@@ -74,15 +139,26 @@ sudo python3 main.py --ip 10.0.0.3 --port 5555 \
 }
 ```
 
-## Файрвол (firewalld / iptables)
+## Файрвол (firewalld / iptables / nftables)
 
 ```bash
-# iptables
+# iptables (ArchLinux по умолчанию)
 sudo iptables -I INPUT -p udp --dport 5555 -j ACCEPT
+
+# nftables
+sudo nft add rule inet filter input udp dport 5555 accept
 
 # firewalld
 sudo firewall-cmd --add-port=5555/udp --permanent
 sudo firewall-cmd --reload
+```
+
+Для ncat-тестов broadcast (порт 4444) — открой его на обеих машинах
+**на интерфейсе tap0**, а не на физическом:
+
+```bash
+sudo iptables -I INPUT -i tap0 -p udp --dport 4444 -j ACCEPT
+sudo iptables -I INPUT -i tap0 -p tcp --dport 5000 -j ACCEPT
 ```
 
 ## Формат пакета
@@ -112,5 +188,21 @@ p2pvpn/
 | Нет аутентификации | Pre-shared key или WireGuard-подобный handshake |
 | Broadcast → всем | Учитывать destination MAC для unicast/multicast |
 | UDP может теряться | Для надёжности добавить ACK для критичных пакетов |
-| Нет NAT-traversal | Добавить UDP hole punching через bootstrap-сервер |
+| Нет NAT-traversal | Уже работает через STUN + UDP hole punching (см. `stun_client.py`) |
+
+## Диагностика
+
+```bash
+# Видно ли VPN-интерфейс:
+ip addr show tap0
+
+# Идёт ли трафик через TAP:
+sudo tcpdump -i tap0 -n
+
+# Идёт ли VPN-трафик по UDP наружу:
+sudo tcpdump -i any -n udp port 5555
+
+# Статистика пиров — смотри лог процесса main.py,
+# каждые 5 секунд печатается таблица alive/pending/dead.
+```
 # P2PLocalGame
