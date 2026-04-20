@@ -220,12 +220,21 @@ async def discover_async(
             request, txn_id = _build_binding_request()
             fut: asyncio.Future = loop.create_future()
 
-            transport, _ = await loop.create_datagram_endpoint(
-                lambda: _STUNProtocol(txn_id, fut),
+            # SO_REUSEPORT (Linux/BSD only) позволяет VPN-сокету занять
+            # тот же порт не дожидаясь закрытия STUN. На Windows флаг не
+            # поддерживается asyncio — но STUN-сокет закрывается до старта
+            # VPN, так что и без него всё работает.
+            endpoint_kwargs = dict(
                 local_addr=("0.0.0.0", local_port),
                 remote_addr=server_addr,
-                reuse_port=True,    # SO_REUSEPORT: VPN-сокет может занять
-            )                       # тот же порт не дожидаясь закрытия
+            )
+            import sys as _sys
+            if _sys.platform != "win32":
+                endpoint_kwargs["reuse_port"] = True
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: _STUNProtocol(txn_id, fut),
+                **endpoint_kwargs,
+            )
 
             try:
                 transport.sendto(request)

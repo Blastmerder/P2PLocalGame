@@ -16,9 +16,9 @@
 
 ## Требования
 
-- Linux (нужен `/dev/net/tun`)
+- **Linux** (нужен `/dev/net/tun`) или **Windows 10/11** (TAP-Windows6)
 - Python 3.10+
-- Root-права (для создания TAP-интерфейса)
+- Root / Administrator (для создания TAP-интерфейса)
 - Открытый UDP-порт (по умолчанию 5555) на файрволе
 
 ## Установка на ArchLinux
@@ -39,6 +39,39 @@ sudo python3 main.py --ip 10.0.0.1 --port 5555 --peer <peer_ip>:5555
 
 Если используется firewalld вместо iptables — см. раздел «Файрвол» ниже.
 `nmap` даёт команду `ncat`, используемую в примерах проверки broadcast.
+
+## Установка на Windows
+
+Нужен драйвер TAP-Windows6 — он ставится вместе с **OpenVPN** или
+**WireGuard**; либо его можно поставить отдельно утилитой `tapctl`.
+
+```powershell
+# 1. Драйвер (любой из вариантов):
+#    • установить OpenVPN Community   https://openvpn.net/community-downloads/
+#    • или WireGuard for Windows      https://www.wireguard.com/install/
+#    • или только драйвер + tapctl    из OpenVPN MSI (компонент «TAP Virtual Ethernet Adapter»)
+
+# 2. Создать виртуальный адаптер (одноразово):
+#    Запустить PowerShell от имени администратора и выполнить:
+& "C:\Program Files\OpenVPN\bin\tapctl.exe" create --name "tap0" --hwid tap0901
+
+# 3. Python + pywin32:
+python -m pip install pywin32
+
+# 4. Запуск (PowerShell от имени администратора):
+python main.py --ip 10.0.0.1 --port 5555 --peer <peer_pub_ip>:5555 --tap tap0
+```
+
+Если в системе один TAP-адаптер, параметр `--tap` можно опустить — код
+найдёт первый адаптер с `ComponentId = tap0901` сам. При нескольких
+адаптерах используй `--tap "<Friendly Name>"` (то самое имя, которое
+показывается в «Сетевые подключения»).
+
+**Правило файрвола Windows:**
+```powershell
+New-NetFirewallRule -DisplayName "P2P L2 VPN" -Direction Inbound `
+    -Protocol UDP -LocalPort 5555 -Action Allow
+```
 
 ## Быстрый старт (2 участника)
 
@@ -174,10 +207,13 @@ TYPE = 0x02  HELLO  — keepalive / анонс присутствия
 
 ```
 p2pvpn/
-├── main.py       — CLI и точка входа
-├── vpn_node.py   — вся логика VPN (TAP, UDP, peer table)
-├── node_a.json   — пример конфига для участника A
-└── node_b.json   — пример конфига для участника B
+├── main.py         — CLI и точка входа
+├── vpn_node.py     — логика VPN (UDP, peer table, hole punching)
+├── tap.py          — кросс-платформенный TAP: Linux (/dev/net/tun)
+│                     и Windows (TAP-Windows6 через pywin32)
+├── stun_client.py  — STUN-клиент для определения публичного адреса
+├── node_a.json     — пример конфига для участника A
+└── node_b.json     — пример конфига для участника B
 ```
 
 ## Известные ограничения и что можно улучшить
