@@ -23,7 +23,9 @@ IFF_TAP     = 0x0002
 IFF_NO_PI   = 0x1000
 ETH_PROTO_ARP = 0x0806
 
-MAX_FRAME   = 65535     # max read size — bounded by TAP_MTU at write time
+MAX_FRAME   = 2048      # max read size — Ethernet(1518) + VLAN + запас.
+                        # Больше не нужно: GSO/TSO отключены ниже, ядро
+                        # не отдаст нам супер-кадр.
 MAGIC       = b"P2PL2"  # 5-byte header prefix to identify our packets
 MAGIC_LEN   = len(MAGIC)
 HEARTBEAT_INTERVAL  = 5   # seconds between regular keepalive pings
@@ -110,53 +112,72 @@ def open_tap(name: str = "tap0") -> tuple[int, str]:
 
 def configure_tap(iface: str, ip: str, prefix: int = 24, mtu: int = TAP_MTU):
     """
-    Bring up the TAP, assign IP, set MTU and clamp TCP MSS.
+    Bring up the TAP, assign IP, set MTU, отключить offload, зажать MSS.
 
-    MTU = 1420: физический MTU(1500) - IP(20) - UDP(8) - MAGIC(6) - PPPoE(46)
-    Без этого: ping OK (маленькие пакеты), TCP/игры — нет (большие дропаются).
+    ── Почему ping работает, а TCP/всё остальное — нет ──
+    Две смертельные ловушки TAP на Linux:
 
-    MSS clamping — КРИТИЧНО для TCP:
-      FORWARD chain = транзитный трафик (роутинг через машину).
-      OUTPUT chain  = трафик, исходящий С этой машины через tap0.
-      INPUT chain   = трафик, входящий В эту машину через tap0.
-    Для прямых соединений host↔host через TAP нужны OUTPUT + INPUT,
-    FORWARD здесь вообще не задействован.
-    --clamp-mss-to-pmtu автоматически берёт MTU интерфейса — надёжнее
-    чем жёсткое число, работает даже если MTU изменится.
+    1) TSO/GSO/GRO offload включены по умолчанию. Ядро отдаёт в TAP
+       «супер-кадры» до 64KB, рассчитывая что NIC их сегментирует.
+       TAP ничего не сегментирует — мы читаем 64KB, суём в UDP, ядро
+       фрагментирует IP, часть фрагментов теряется → весь TCP встаёт.
+       Лечится: ethtool -K tap0 tso off gso off gro off lro off
+
+    2) MSS не зажат → TCP между пирами пытается послать 1460-байтные
+       сегменты, которые после инкапсуляции не влезают в физический MTU.
+       Лечится: iptables TCPMSS --set-mss <mtu-40> на OUTPUT и INPUT tap0.
+
+    Используем --set-mss <число>, а не --clamp-mss-to-pmtu, потому что
+    clamp полагается на PMTU-кеш ядра, который часто пуст на свежем
+    интерфейсе и MSS тогда не зажимается вовсе.
+
+    MTU = 1420: 1500 - IP(20) - UDP(8) - MAGIC(6) - запас на PPPoE/VPN(46).
     """
     mask = f"{ip}/{prefix}"
+    mss  = mtu - 40   # IPv4(20) + TCP(20)
 
     # Базовые команды — обязательны
     base_cmds = [
         f"ip link set {iface} mtu {mtu}",
         f"ip link set {iface} up",
-        f"ip addr add {mask} dev {iface}",
+        f"ip addr replace {mask} dev {iface}",
     ]
     for cmd in base_cmds:
         ret = os.system(cmd)
         if ret != 0:
             raise RuntimeError(f"Command failed ({ret}): {cmd}")
 
-    # MSS clamping — желательны, но не фатальны при отсутствии iptables
-    mss_cmds = [
-        # Трафик, уходящий с этой машины через tap0 (наш ncat-клиент, игра)
-        f"iptables -t mangle -C OUTPUT -o {iface} -p tcp "
-        f"--tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || "
-        f"iptables -t mangle -A OUTPUT -o {iface} -p tcp "
-        f"--tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
+    # Отключаем segmentation offload — КРИТИЧНО, без этого всё «ложится»
+    # на чём угодно крупнее ping. ethtool молча ничего не делает для
+    # флагов, которых TAP не поддерживает, это ок.
+    offload_cmd = (
+        f"ethtool -K {iface} tso off gso off gro off lro off "
+        f"tx off sg off 2>/dev/null"
+    )
+    if os.system(offload_cmd) != 0:
+        log.warning("ethtool not found — install `ethtool`, иначе TCP/"
+                    "большие UDP будут теряться (TSO/GSO на TAP)")
 
-        # Трафик, приходящий на эту машину через tap0 (от пира)
-        f"iptables -t mangle -C INPUT -i {iface} -p tcp "
-        f"--tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || "
-        f"iptables -t mangle -A INPUT -i {iface} -p tcp "
-        f"--tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
+    # MSS clamping — явно жёстким числом, без зависимости от PMTU-кеша
+    mss_rules = [
+        ("OUTPUT", f"-o {iface}"),   # исходящий с этой машины через tap0
+        ("INPUT",  f"-i {iface}"),   # входящий на эту машину через tap0
     ]
-    for cmd in mss_cmds:
-        ret = os.system(cmd)
-        if ret != 0:
-            log.warning("iptables MSS clamp failed (no iptables?): continuing anyway")
+    for chain, match in mss_rules:
+        check = (
+            f"iptables -t mangle -C {chain} {match} -p tcp "
+            f"--tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null"
+        )
+        add = (
+            f"iptables -t mangle -A {chain} {match} -p tcp "
+            f"--tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
+        )
+        if os.system(f"{check} || {add}") != 0:
+            log.warning("iptables MSS clamp failed for %s — "
+                        "большие TCP-потоки могут рваться", chain)
 
-    log.info("Configured %s  ip=%s  mtu=%d  mss=%d", iface, mask, mtu, mtu - 40)
+    log.info("Configured %s  ip=%s  mtu=%d  mss=%d  (offload off)",
+             iface, mask, mtu, mss)
 
 
 # ──────────────────────────────────────────────────────────────
