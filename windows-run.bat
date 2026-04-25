@@ -5,13 +5,18 @@ REM ------------------------------------------------------------
 REM  Что делает:
 REM    1) перезапускается от Администратора (UAC)
 REM    2) ставит pywin32 если его нет
-REM    3) ищет tapctl.exe (OpenVPN или WireGuard)
-REM    4) создаёт TAP-адаптер "tap0" если ещё нет
-REM    5) добавляет правило брандмауэра UDP 5555
-REM    6) запускает main.py со всеми переданными аргументами
+REM    3) ищет/использует уже созданный TAP-Windows6 адаптер,
+REM       при необходимости создаёт его через tapctl или tapinstall
+REM    4) добавляет правило брандмауэра UDP 5555
+REM    5) запускает main.py со всеми переданными аргументами
 REM
 REM  Пример:
 REM    windows-run.bat --ip 10.0.0.1 --port 5555 --peer 1.2.3.4:5555
+REM
+REM  Переменные окружения (опциональные):
+REM    set TAPCTL=C:\path\to\tapctl.exe       — явно указать путь
+REM    set TAPINSTALL=C:\path\to\tapinstall.exe
+REM    set TAPINF=C:\path\to\OemVista.inf
 REM ============================================================
 setlocal enableextensions enabledelayedexpansion
 chcp 65001 >nul
@@ -40,43 +45,113 @@ if %errorlevel% neq 0 (
     python -m pip install --quiet --upgrade pywin32
     if !errorlevel! neq 0 (
         echo [error] pip install pywin32 failed.
-        echo         Если используется Python 3.14 и колеса ещё нет —
-        echo         поставь Python 3.12/3.13 рядом и запусти отсюда.
+        echo         Если Python 3.14 — поставь 3.12/3.13 рядом и запусти отсюда.
         pause & exit /b 1
     )
 )
 
-REM --- 4. tapctl.exe location -----------------------------------
-set "TAPCTL="
-for %%P in (
-    "%ProgramFiles%\OpenVPN\bin\tapctl.exe"
-    "%ProgramFiles(x86)%\OpenVPN\bin\tapctl.exe"
-    "%ProgramFiles%\WireGuard\tapctl.exe"
-    "%ProgramFiles(x86)%\WireGuard\tapctl.exe"
-) do (
-    if exist "%%~P" set "TAPCTL=%%~P"
-)
-if not defined TAPCTL (
-    echo [error] tapctl.exe not found.
-    echo         Установи OpenVPN  https://openvpn.net/community-downloads/
-    echo         или WireGuard     https://www.wireguard.com/install/
-    pause & exit /b 1
-)
-echo [setup] tapctl: !TAPCTL!
+REM --- 4. есть ли уже какой-то TAP-Windows6 адаптер? -----------
+set "TAP_NAME="
+for /f "usebackq delims=" %%N in (`powershell -NoProfile -Command "(Get-NetAdapter -ErrorAction SilentlyContinue ^| Where-Object { $_.InterfaceDescription -like 'TAP-Windows*' } ^| Select-Object -First 1).Name"`) do set "TAP_NAME=%%N"
 
-REM --- 5. TAP-адаптер -------------------------------------------
-set HAVE_TAP=
-for /f "delims=" %%L in ('""!TAPCTL!" list" 2^>nul') do set HAVE_TAP=1
-if not defined HAVE_TAP (
-    echo [setup] creating TAP-Windows6 adapter "tap0"...
+if defined TAP_NAME (
+    echo [setup] existing TAP adapter found: "!TAP_NAME!"
+    goto :ensure_named_tap0
+)
+
+REM --- 5. создаём адаптер: tapctl, иначе tapinstall ------------
+echo [setup] no TAP-Windows6 adapter found, will create one.
+
+REM 5a. tapctl.exe — пробуем env, потом известные пути
+if not defined TAPCTL (
+    for %%P in (
+        "%ProgramFiles%\OpenVPN\bin\tapctl.exe"
+        "%ProgramFiles(x86)%\OpenVPN\bin\tapctl.exe"
+        "%ProgramFiles%\OpenVPN Connect\bin\tapctl.exe"
+        "%ProgramFiles(x86)%\OpenVPN Connect\bin\tapctl.exe"
+        "%ProgramFiles%\WireGuard\tapctl.exe"
+        "%ProgramFiles(x86)%\WireGuard\tapctl.exe"
+    ) do if exist "%%~P" if not defined TAPCTL set "TAPCTL=%%~P"
+)
+
+if defined TAPCTL (
+    echo [setup] using tapctl: !TAPCTL!
     "!TAPCTL!" create --name tap0 --hwid tap0901
     if !errorlevel! neq 0 (
-        echo [error] tapctl create failed.
+        echo [error] tapctl create failed
         pause & exit /b 1
     )
-) else (
-    echo [setup] TAP adapter already exists.
+    goto :ensure_named_tap0
 )
+
+REM 5b. tapinstall.exe (он же devcon) — приходит со standalone TAP-Windows6
+if not defined TAPINSTALL (
+    for %%P in (
+        "%ProgramFiles%\TAP-Windows\bin\tapinstall.exe"
+        "%ProgramFiles(x86)%\TAP-Windows\bin\tapinstall.exe"
+        "%ProgramFiles%\OpenVPN\bin\tapinstall.exe"
+        "%ProgramFiles(x86)%\OpenVPN\bin\tapinstall.exe"
+    ) do if exist "%%~P" if not defined TAPINSTALL set "TAPINSTALL=%%~P"
+)
+if not defined TAPINF (
+    for %%P in (
+        "%ProgramFiles%\TAP-Windows\driver\OemVista.inf"
+        "%ProgramFiles(x86)%\TAP-Windows\driver\OemVista.inf"
+        "%ProgramFiles%\OpenVPN\driver\OemVista.inf"
+        "%ProgramFiles(x86)%\OpenVPN\driver\OemVista.inf"
+    ) do if exist "%%~P" if not defined TAPINF set "TAPINF=%%~P"
+)
+
+if defined TAPINSTALL if defined TAPINF (
+    echo [setup] using tapinstall: !TAPINSTALL!
+    echo [setup] driver inf:        !TAPINF!
+    "!TAPINSTALL!" install "!TAPINF!" tap0901
+    if !errorlevel! neq 0 (
+        echo [error] tapinstall failed
+        pause & exit /b 1
+    )
+    REM tapinstall именует адаптер сам — найдём и переименуем ниже
+    goto :ensure_named_tap0
+)
+
+REM 5c. ничего не нашли — даём понятную инструкцию
+echo.
+echo [error] не найден ни tapctl.exe, ни tapinstall.exe.
+echo         Установи драйвер TAP-Windows6 одним из способов:
+echo.
+echo           [A] OpenVPN Community ^(включает tapctl и tapinstall^):
+echo               https://openvpn.net/community-downloads/
+echo.
+echo           [B] standalone TAP-Windows6 драйвер:
+echo               https://build.openvpn.net/downloads/releases/
+echo               файл вида tap-windows-9.24.7-I601-Win10.exe
+echo.
+echo         Если tapctl лежит в нестандартном месте — задай путь:
+echo               set TAPCTL=C:\path\to\tapctl.exe
+echo               windows-run.bat ...
+pause & exit /b 1
+
+REM ============================================================
+REM   гарантируем что в системе есть адаптер с именем "tap0"
+REM ============================================================
+:ensure_named_tap0
+REM перечитываем имя — после tapinstall оно появится
+if not defined TAP_NAME (
+    for /f "usebackq delims=" %%N in (`powershell -NoProfile -Command "(Get-NetAdapter -ErrorAction SilentlyContinue ^| Where-Object { $_.InterfaceDescription -like 'TAP-Windows*' } ^| Select-Object -First 1).Name"`) do set "TAP_NAME=%%N"
+)
+if not defined TAP_NAME (
+    echo [error] adapter created but Get-NetAdapter не видит его. Перезагрузись и запусти ещё раз.
+    pause & exit /b 1
+)
+if /i not "!TAP_NAME!"=="tap0" (
+    echo [setup] renaming "!TAP_NAME!" -> "tap0"
+    powershell -NoProfile -Command "Rename-NetAdapter -Name '!TAP_NAME!' -NewName 'tap0'" || (
+        echo [warn] не смог переименовать, продолжаем с именем "!TAP_NAME!"
+        echo        — придётся передать его в --tap "!TAP_NAME!"
+    )
+)
+REM на всякий случай поднимаем линк (вдруг был disabled)
+powershell -NoProfile -Command "Enable-NetAdapter -Name 'tap0' -Confirm:$false -ErrorAction SilentlyContinue" >nul 2>&1
 
 REM --- 6. firewall (UDP 5555 inbound) ---------------------------
 netsh advfirewall firewall show rule name="P2P L2 VPN" >nul 2>&1

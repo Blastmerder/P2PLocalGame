@@ -45,10 +45,15 @@ sudo python3 main.py --ip 10.0.0.1 --port 5555 --peer <peer_ip>:5555
 Все шаги (драйвер-проверка, создание TAP-адаптера, pywin32, firewall,
 запуск) автоматизированы в `windows-run.bat`.
 
-**Одноразово**: поставить драйвер TAP-Windows6 — он идёт с
-[OpenVPN Community](https://openvpn.net/community-downloads/) или
-[WireGuard for Windows](https://www.wireguard.com/install/),
-любой из двух подойдёт. Python 3.10+ должен быть в `PATH`.
+**Одноразово**: поставить драйвер TAP-Windows6 — любой источник:
+
+| Источник | Что даёт | Где взять |
+|---|---|---|
+| **OpenVPN Community** (рекомендуется) | tapctl.exe + tapinstall.exe + драйвер | https://openvpn.net/community-downloads/ |
+| **TAP-Windows6 standalone** | tapinstall.exe + драйвер | https://build.openvpn.net/downloads/releases/ (`tap-windows-9.x.y-…exe`) |
+| **WireGuard for Windows** | по умолчанию использует Wintun, **tapctl обычно не идёт** — не подходит, ставь OpenVPN |
+
+Python 3.10+ должен быть в `PATH`.
 
 **Запуск** (двойной клик / cmd / PowerShell):
 
@@ -60,21 +65,41 @@ windows-run.bat --ip 10.0.0.1 --port 5555 --peer 94.180.149.23:5555
 
 1. Перезапускается от Администратора (UAC-промпт).
 2. `pip install pywin32` — если ещё не стоит.
-3. Ищет `tapctl.exe` в `%ProgramFiles%\OpenVPN\bin` / `\WireGuard`.
-4. Создаёт TAP-адаптер `tap0` через `tapctl create --hwid tap0901`,
-   если его ещё нет.
-5. Добавляет правило брандмауэра «P2P L2 VPN» — UDP 5555 inbound
+3. Ищет уже созданный TAP-Windows6 адаптер через `Get-NetAdapter`.
+4. Если адаптера нет — создаёт его:
+   - сначала пробует `tapctl.exe` (OpenVPN Community / OpenVPN Connect / WireGuard);
+   - если не нашёл — `tapinstall.exe` + `OemVista.inf` (стандалон-драйвер
+     или старый OpenVPN без tapctl).
+5. Если найденный адаптер называется не `tap0` — переименовывает через
+   `Rename-NetAdapter`.
+6. Добавляет правило брандмауэра «P2P L2 VPN» — UDP 5555 inbound
    (идемпотентно, не дублирует).
-6. Запускает `python main.py` с теми аргументами, что ты передал bat-у.
+7. Запускает `python main.py` с теми аргументами, что ты передал bat-у.
 
-Все шаги после первого запуска кешируются — дальше bat просто стартует
-VPN.
+**Если `tapctl/tapinstall` лежит в нестандартном месте** — задай
+переменные окружения перед запуском:
+
+```bat
+set TAPCTL=D:\Tools\OpenVPN\bin\tapctl.exe
+windows-run.bat --ip 10.0.0.1 --peer 1.2.3.4:5555
+
+REM или связкой:
+set TAPINSTALL=D:\Tools\TAP-Windows\bin\tapinstall.exe
+set TAPINF=D:\Tools\TAP-Windows\driver\OemVista.inf
+windows-run.bat ...
+```
 
 ### Если всё-таки хочется руками
 
 ```powershell
 # PowerShell от имени Администратора:
 & "C:\Program Files\OpenVPN\bin\tapctl.exe" create --name tap0 --hwid tap0901
+# или (если есть только tapinstall):
+& "C:\Program Files\TAP-Windows\bin\tapinstall.exe" install `
+    "C:\Program Files\TAP-Windows\driver\OemVista.inf" tap0901
+Get-NetAdapter | Where-Object InterfaceDescription -like 'TAP-Windows*' |
+    Rename-NetAdapter -NewName tap0
+
 python -m pip install pywin32
 New-NetFirewallRule -DisplayName "P2P L2 VPN" -Direction Inbound `
     -Protocol UDP -LocalPort 5555 -Action Allow
