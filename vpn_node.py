@@ -3,29 +3,45 @@
 P2P L2 VPN Node — creates a virtual Ethernet (TAP) interface
 and tunnels raw Ethernet frames over UDP to all known peers.
 
-Designed for Linux gaming LANs. Easily extensible to N peers.
+Cross-platform: Linux (/dev/net/tun) and Windows (TAP-Windows6).
+See tap.py for platform-specific details.
 """
 
 import asyncio
-import fcntl
 import logging
-import os
-import struct
+import socket
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from tap import TAPDevice
+
+
+def _make_udp_socket(port: int) -> socket.socket:
+    """
+    Создать UDP-сокет, готовый к биндингу на 0.0.0.0:port.
+
+    SO_REUSEADDR обязательно — на Windows без него bind() падает
+    с WSAEADDRINUSE если STUN-сокет ещё не до конца закрыт.
+    SO_REUSEPORT — где доступно (Linux/BSD), позволяет нескольким
+    сокетам слушать тот же порт одновременно.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+    sock.setblocking(False)
+    sock.bind(("0.0.0.0", port))
+    return sock
+
 # ──────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────
-TUNSETIFF   = 0x400454CA
-IFF_TAP     = 0x0002
-IFF_NO_PI   = 0x1000
 ETH_PROTO_ARP = 0x0806
 
-MAX_FRAME   = 2048      # max read size — Ethernet(1518) + VLAN + запас.
-                        # Больше не нужно: GSO/TSO отключены ниже, ядро
-                        # не отдаст нам супер-кадр.
 MAGIC       = b"P2PL2"  # 5-byte header prefix to identify our packets
 MAGIC_LEN   = len(MAGIC)
 HEARTBEAT_INTERVAL  = 5   # seconds between regular keepalive pings
@@ -97,90 +113,6 @@ class Peer:
 
 
 # ──────────────────────────────────────────────────────────────
-# TAP interface helpers
-# ──────────────────────────────────────────────────────────────
-def open_tap(name: str = "tap0") -> tuple[int, str]:
-    """Open (or create) a TAP interface, return (fd, actual_name)."""
-    TUNDEV = "/dev/net/tun"
-    fd = os.open(TUNDEV, os.O_RDWR | os.O_NONBLOCK)
-    ifr = struct.pack("16sH22x", name.encode(), IFF_TAP | IFF_NO_PI)
-    ioctl_result = fcntl.ioctl(fd, TUNSETIFF, ifr)
-    actual_name = ioctl_result[:16].rstrip(b"\x00").decode()
-    log.info("Opened TAP interface: %s (fd=%d)", actual_name, fd)
-    return fd, actual_name
-
-
-def configure_tap(iface: str, ip: str, prefix: int = 24, mtu: int = TAP_MTU):
-    """
-    Bring up the TAP, assign IP, set MTU, отключить offload, зажать MSS.
-
-    ── Почему ping работает, а TCP/всё остальное — нет ──
-    Две смертельные ловушки TAP на Linux:
-
-    1) TSO/GSO/GRO offload включены по умолчанию. Ядро отдаёт в TAP
-       «супер-кадры» до 64KB, рассчитывая что NIC их сегментирует.
-       TAP ничего не сегментирует — мы читаем 64KB, суём в UDP, ядро
-       фрагментирует IP, часть фрагментов теряется → весь TCP встаёт.
-       Лечится: ethtool -K tap0 tso off gso off gro off lro off
-
-    2) MSS не зажат → TCP между пирами пытается послать 1460-байтные
-       сегменты, которые после инкапсуляции не влезают в физический MTU.
-       Лечится: iptables TCPMSS --set-mss <mtu-40> на OUTPUT и INPUT tap0.
-
-    Используем --set-mss <число>, а не --clamp-mss-to-pmtu, потому что
-    clamp полагается на PMTU-кеш ядра, который часто пуст на свежем
-    интерфейсе и MSS тогда не зажимается вовсе.
-
-    MTU = 1420: 1500 - IP(20) - UDP(8) - MAGIC(6) - запас на PPPoE/VPN(46).
-    """
-    mask = f"{ip}/{prefix}"
-    mss  = mtu - 40   # IPv4(20) + TCP(20)
-
-    # Базовые команды — обязательны
-    base_cmds = [
-        f"ip link set {iface} mtu {mtu}",
-        f"ip link set {iface} up",
-        f"ip addr replace {mask} dev {iface}",
-    ]
-    for cmd in base_cmds:
-        ret = os.system(cmd)
-        if ret != 0:
-            raise RuntimeError(f"Command failed ({ret}): {cmd}")
-
-    # Отключаем segmentation offload — КРИТИЧНО, без этого всё «ложится»
-    # на чём угодно крупнее ping. ethtool молча ничего не делает для
-    # флагов, которых TAP не поддерживает, это ок.
-    offload_cmd = (
-        f"ethtool -K {iface} tso off gso off gro off lro off "
-        f"tx off sg off 2>/dev/null"
-    )
-    if os.system(offload_cmd) != 0:
-        log.warning("ethtool not found — install `ethtool`, иначе TCP/"
-                    "большие UDP будут теряться (TSO/GSO на TAP)")
-
-    # MSS clamping — явно жёстким числом, без зависимости от PMTU-кеша
-    mss_rules = [
-        ("OUTPUT", f"-o {iface}"),   # исходящий с этой машины через tap0
-        ("INPUT",  f"-i {iface}"),   # входящий на эту машину через tap0
-    ]
-    for chain, match in mss_rules:
-        check = (
-            f"iptables -t mangle -C {chain} {match} -p tcp "
-            f"--tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null"
-        )
-        add = (
-            f"iptables -t mangle -A {chain} {match} -p tcp "
-            f"--tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
-        )
-        if os.system(f"{check} || {add}") != 0:
-            log.warning("iptables MSS clamp failed for %s — "
-                        "большие TCP-потоки могут рваться", chain)
-
-    log.info("Configured %s  ip=%s  mtu=%d  mss=%d  (offload off)",
-             iface, mask, mtu, mss)
-
-
-# ──────────────────────────────────────────────────────────────
 # Packet wire format
 #
 #   [ MAGIC (5) | TYPE (1) | PAYLOAD ]
@@ -216,39 +148,24 @@ class VPNNode:
     def __init__(self, config):
         self.cfg = config
         self.peers: Dict[tuple, Peer] = {}   # (host, port) → Peer
-        self._tap_fd: Optional[int] = None
-        self._iface: Optional[str] = None
+        self._tap = None                     # tap.TAPDevice
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ── Setup ────────────────────────────────────────────────
 
     def setup_tap(self):
-        self._tap_fd, self._iface = open_tap(self.cfg["tap_name"])
-        configure_tap(self._iface, self.cfg["local_ip"], self.cfg.get("prefix", 24))
+        self._tap = TAPDevice(
+            name=self.cfg.get("tap_name", "tap0"),
+            ip=self.cfg["local_ip"],
+            prefix=self.cfg.get("prefix", 24),
+            mtu=self.cfg.get("mtu", TAP_MTU),
+        )
+        self._tap.setup()
 
     def teardown_tap(self):
-        """Убрать iptables правила и опустить интерфейс при завершении."""
-        if not self._iface:
-            return
-        iface = self._iface
-        cleanup_cmds = [
-            f"iptables -t mangle -D OUTPUT -o {iface} -p tcp "
-            f"--tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null",
-            f"iptables -t mangle -D INPUT -i {iface} -p tcp "
-            f"--tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null",
-            f"ip link set {iface} down 2>/dev/null",
-            f"ip addr flush dev {iface} 2>/dev/null",
-        ]
-        for cmd in cleanup_cmds:
-            os.system(cmd)
-        if self._tap_fd is not None:
-            try:
-                self._loop.remove_reader(self._tap_fd)
-                os.close(self._tap_fd)
-            except Exception:
-                pass
-        log.info("TAP %s torn down", iface)
+        if self._tap is not None:
+            self._tap.teardown()
 
     def _add_initial_peers(self):
         for hp in self.cfg.get("peers", []):
@@ -300,45 +217,13 @@ class VPNNode:
             log.debug("HELLO from %s:%d", *addr)
 
     def _write_tap(self, frame: bytes):
-        """
-        Записать Ethernet-фрейм в TAP-интерфейс.
-        TAP fd неблокирующий: при переполнении буфера получаем EAGAIN —
-        логируем и пропускаем (лучше потерять один фрейм, чем подвиснуть).
-        """
-        try:
-            os.write(self._tap_fd, frame)
-        except BlockingIOError:
-            log.warning("TAP write buffer full, frame dropped (%d bytes)", len(frame))
-        except OSError as e:
-            log.warning("TAP write error: %s", e)
+        """Записать Ethernet-фрейм в TAP (через платформенный backend)."""
+        self._tap.write(frame)
 
-    def _start_tap_reader(self):
-        """
-        Регистрируем TAP-fd в event loop через add_reader (epoll).
-        Callback вызывается мгновенно при появлении данных — без потоков,
-        без sleep, без busy-wait. Именно так должен работать async I/O.
-        """
-        self._loop.add_reader(self._tap_fd, self._on_tap_readable)
-        log.debug("TAP reader registered via add_reader (epoll)")
-
-    def _on_tap_readable(self):
-        """
-        Вызывается event loop'ом когда TAP fd готов к чтению.
-        Читаем ВСЕ доступные фреймы за один вызов (burst read),
-        чтобы не копить очередь при пиковой нагрузке.
-        """
-        try:
-            while True:
-                try:
-                    frame = os.read(self._tap_fd, MAX_FRAME)
-                    if frame:
-                        log.debug("TAP → %d bytes, forwarding to peers", len(frame))
-                        self._broadcast(frame)
-                except BlockingIOError:
-                    # Буфер исчерпан — выходим, epoll позовёт снова когда придут данные
-                    break
-        except OSError as e:
-            log.error("TAP read error: %s", e)
+    def _on_tap_frame(self, frame: bytes):
+        """Callback из TAP: один готовый Ethernet-фрейм → всем пирам."""
+        log.debug("TAP → %d bytes, forwarding to peers", len(frame))
+        self._broadcast(frame)
 
     def _broadcast(self, frame: bytes):
         """Send an Ethernet frame to all reachable peers.
@@ -427,12 +312,13 @@ class VPNNode:
         self.setup_tap()
         self._add_initial_peers()
 
-        # Create UDP socket (SO_REUSEPORT позволяет занять порт сразу после
-        # STUN-сокета без ожидания TIME_WAIT — оба используют один порт)
+        # UDP-сокет создаём вручную, чтобы выставить SO_REUSEADDR
+        # (+ SO_REUSEPORT на Linux). Это лечит WSAEADDRINUSE на Windows
+        # после закрытия STUN-сокета: asyncio.transport.close() освобождает
+        # порт асинхронно, и без REUSEADDR следующий bind() падает.
         transport, _ = await self._loop.create_datagram_endpoint(
             lambda: self._UDPProtocol(self),
-            local_addr=("0.0.0.0", self.cfg["listen_port"]),
-            reuse_port=True,
+            sock=_make_udp_socket(self.cfg["listen_port"]),
         )
 
         # Send initial HELLO to bootstrap peers
@@ -444,8 +330,8 @@ class VPNNode:
         log.info("VPN node started. Local IP: %s  Port: %d",
                  self.cfg["local_ip"], self.cfg["listen_port"])
 
-        # Регистрируем TAP через epoll (не coroutine, просто add_reader)
-        self._start_tap_reader()
+        # Запускаем TAP-ридер: epoll на Linux / поток на Windows
+        self._tap.start_reading(self._loop, self._on_tap_frame)
 
         try:
             await asyncio.gather(

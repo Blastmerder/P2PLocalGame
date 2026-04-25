@@ -220,15 +220,32 @@ async def discover_async(
             request, txn_id = _build_binding_request()
             fut: asyncio.Future = loop.create_future()
 
+            # Поднимаем сокет вручную с SO_REUSEADDR (+ REUSEPORT где есть).
+            # Без REUSEADDR на Windows VPN-сокет потом не сможет забиндиться
+            # на тот же порт — asyncio.transport.close() освобождает порт
+            # асинхронно, bind() ловит WSAEADDRINUSE.
+            #
+            # ВАЖНО: НЕ делаем sock.connect(server_addr). На Windows
+            # ProactorEventLoop в Python 3.14 при connected-сокете
+            # transport.sendto(data) уходит в WSASendTo с addr=None
+            # и падает ("argument 4 must be tuple, not None"). Передаём
+            # адрес явно в transport.sendto(request, server_addr).
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except (AttributeError, OSError):
+                    pass
+            sock.setblocking(False)
+            sock.bind(("0.0.0.0", local_port))
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: _STUNProtocol(txn_id, fut),
-                local_addr=("0.0.0.0", local_port),
-                remote_addr=server_addr,
-                reuse_port=True,    # SO_REUSEPORT: VPN-сокет может занять
-            )                       # тот же порт не дожидаясь закрытия
+                sock=sock,
+            )
 
             try:
-                transport.sendto(request)
+                transport.sendto(request, server_addr)
                 ip, pub_port = await asyncio.wait_for(fut, timeout=timeout)
                 log.info("STUN success via %s → %s:%d", label, ip, pub_port)
                 return STUNResult(

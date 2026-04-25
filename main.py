@@ -21,13 +21,13 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import signal
 import sys
 from typing import Optional
 
 from vpn_node import VPNNode
 from stun_client import discover_async, STUNResult
+from tap import is_admin
 
 log = logging.getLogger("vpn.main")
 
@@ -65,8 +65,12 @@ def build_config(args) -> dict:
     return cfg
 
 
-def check_root():
-    if os.geteuid() != 0:
+def check_privileges():
+    """Требуется root на Linux / Administrator на Windows — для TAP."""
+    if not is_admin():
+        if sys.platform == "win32":
+            sys.exit("Error: must run as Administrator "
+                     "(TAP-Windows6 requires admin rights).")
         sys.exit("Error: must run as root (TAP interface requires root).")
 
 
@@ -131,8 +135,12 @@ async def main_async(cfg: dict):
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
-    loop.add_signal_handler(signal.SIGINT,  _shutdown)
-    loop.add_signal_handler(signal.SIGTERM, _shutdown)
+    # add_signal_handler не поддерживается в ProactorEventLoop на Windows,
+    # но там Ctrl-C всё равно прилетает как KeyboardInterrupt в asyncio.run —
+    # обрабатываем его в main().
+    if sys.platform != "win32":
+        loop.add_signal_handler(signal.SIGINT,  _shutdown)
+        loop.add_signal_handler(signal.SIGTERM, _shutdown)
 
     try:
         await node.run()
@@ -178,7 +186,7 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    check_root()
+    check_privileges()
     cfg = build_config(args)
     cfg["skip_stun"]    = args.no_stun
     cfg["stun_timeout"] = args.stun_timeout
@@ -197,7 +205,11 @@ def main():
   ║  TAP Iface  : {cfg.get('tap_name','tap0'):<22} ║
   ║  Peers      : {len(cfg.get('peers',[])):<22} ║""")
 
-    asyncio.run(main_async(cfg))
+    try:
+        asyncio.run(main_async(cfg))
+    except KeyboardInterrupt:
+        # На Windows Ctrl-C прилетает сюда вместо signal handler'а
+        log.info("Interrupted by user.")
 
 
 if __name__ == "__main__":
