@@ -42,35 +42,43 @@ sudo python3 main.py --ip 10.0.0.1 --port 5555 --peer <peer_ip>:5555
 
 ## Установка на Windows
 
-Нужен драйвер TAP-Windows6 — он ставится вместе с **OpenVPN** или
-**WireGuard**; либо его можно поставить отдельно утилитой `tapctl`.
+Все шаги (драйвер-проверка, создание TAP-адаптера, pywin32, firewall,
+запуск) автоматизированы в `windows-run.bat`.
 
-```powershell
-# 1. Драйвер (любой из вариантов):
-#    • установить OpenVPN Community   https://openvpn.net/community-downloads/
-#    • или WireGuard for Windows      https://www.wireguard.com/install/
-#    • или только драйвер + tapctl    из OpenVPN MSI (компонент «TAP Virtual Ethernet Adapter»)
+**Одноразово**: поставить драйвер TAP-Windows6 — он идёт с
+[OpenVPN Community](https://openvpn.net/community-downloads/) или
+[WireGuard for Windows](https://www.wireguard.com/install/),
+любой из двух подойдёт. Python 3.10+ должен быть в `PATH`.
 
-# 2. Создать виртуальный адаптер (одноразово):
-#    Запустить PowerShell от имени администратора и выполнить:
-& "C:\Program Files\OpenVPN\bin\tapctl.exe" create --name "tap0" --hwid tap0901
+**Запуск** (двойной клик / cmd / PowerShell):
 
-# 3. Python + pywin32:
-python -m pip install pywin32
-
-# 4. Запуск (PowerShell от имени администратора):
-python main.py --ip 10.0.0.1 --port 5555 --peer <peer_pub_ip>:5555 --tap tap0
+```bat
+windows-run.bat --ip 10.0.0.1 --port 5555 --peer 94.180.149.23:5555
 ```
 
-Если в системе один TAP-адаптер, параметр `--tap` можно опустить — код
-найдёт первый адаптер с `ComponentId = tap0901` сам. При нескольких
-адаптерах используй `--tap "<Friendly Name>"` (то самое имя, которое
-показывается в «Сетевые подключения»).
+Что делает скрипт:
 
-**Правило файрвола Windows:**
+1. Перезапускается от Администратора (UAC-промпт).
+2. `pip install pywin32` — если ещё не стоит.
+3. Ищет `tapctl.exe` в `%ProgramFiles%\OpenVPN\bin` / `\WireGuard`.
+4. Создаёт TAP-адаптер `tap0` через `tapctl create --hwid tap0901`,
+   если его ещё нет.
+5. Добавляет правило брандмауэра «P2P L2 VPN» — UDP 5555 inbound
+   (идемпотентно, не дублирует).
+6. Запускает `python main.py` с теми аргументами, что ты передал bat-у.
+
+Все шаги после первого запуска кешируются — дальше bat просто стартует
+VPN.
+
+### Если всё-таки хочется руками
+
 ```powershell
+# PowerShell от имени Администратора:
+& "C:\Program Files\OpenVPN\bin\tapctl.exe" create --name tap0 --hwid tap0901
+python -m pip install pywin32
 New-NetFirewallRule -DisplayName "P2P L2 VPN" -Direction Inbound `
     -Protocol UDP -LocalPort 5555 -Action Allow
+python main.py --ip 10.0.0.1 --port 5555 --peer <peer_pub_ip>:5555 --tap tap0
 ```
 
 ## Быстрый старт (2 участника)
@@ -207,13 +215,14 @@ TYPE = 0x02  HELLO  — keepalive / анонс присутствия
 
 ```
 p2pvpn/
-├── main.py         — CLI и точка входа
-├── vpn_node.py     — логика VPN (UDP, peer table, hole punching)
-├── tap.py          — кросс-платформенный TAP: Linux (/dev/net/tun)
-│                     и Windows (TAP-Windows6 через pywin32)
-├── stun_client.py  — STUN-клиент для определения публичного адреса
-├── node_a.json     — пример конфига для участника A
-└── node_b.json     — пример конфига для участника B
+├── main.py            — CLI и точка входа
+├── vpn_node.py        — логика VPN (UDP, peer table, hole punching)
+├── tap.py             — кросс-платформенный TAP: Linux (/dev/net/tun)
+│                        и Windows (TAP-Windows6 через pywin32)
+├── stun_client.py     — STUN-клиент для определения публичного адреса
+├── windows-run.bat    — установка и запуск на Windows одной командой
+├── node_a.json        — пример конфига для участника A
+└── node_b.json        — пример конфига для участника B
 ```
 
 ## Известные ограничения и что можно улучшить
