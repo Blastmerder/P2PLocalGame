@@ -220,20 +220,23 @@ async def discover_async(
             request, txn_id = _build_binding_request()
             fut: asyncio.Future = loop.create_future()
 
-            # SO_REUSEPORT (Linux/BSD only) позволяет VPN-сокету занять
-            # тот же порт не дожидаясь закрытия STUN. На Windows флаг не
-            # поддерживается asyncio — но STUN-сокет закрывается до старта
-            # VPN, так что и без него всё работает.
-            endpoint_kwargs = dict(
-                local_addr=("0.0.0.0", local_port),
-                remote_addr=server_addr,
-            )
-            import sys as _sys
-            if _sys.platform != "win32":
-                endpoint_kwargs["reuse_port"] = True
+            # Поднимаем сокет вручную с SO_REUSEADDR (+ REUSEPORT где есть).
+            # Без REUSEADDR на Windows VPN-сокет потом не сможет забиндиться
+            # на тот же порт — asyncio.transport.close() освобождает порт
+            # асинхронно, bind() ловит WSAEADDRINUSE.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except (AttributeError, OSError):
+                    pass
+            sock.setblocking(False)
+            sock.bind(("0.0.0.0", local_port))
+            sock.connect(server_addr)
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: _STUNProtocol(txn_id, fut),
-                **endpoint_kwargs,
+                sock=sock,
             )
 
             try:

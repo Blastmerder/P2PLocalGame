@@ -9,11 +9,33 @@ See tap.py for platform-specific details.
 
 import asyncio
 import logging
+import socket
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 from tap import TAPDevice
+
+
+def _make_udp_socket(port: int) -> socket.socket:
+    """
+    Создать UDP-сокет, готовый к биндингу на 0.0.0.0:port.
+
+    SO_REUSEADDR обязательно — на Windows без него bind() падает
+    с WSAEADDRINUSE если STUN-сокет ещё не до конца закрыт.
+    SO_REUSEPORT — где доступно (Linux/BSD), позволяет нескольким
+    сокетам слушать тот же порт одновременно.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+    sock.setblocking(False)
+    sock.bind(("0.0.0.0", port))
+    return sock
 
 # ──────────────────────────────────────────────────────────────
 # Constants
@@ -290,19 +312,13 @@ class VPNNode:
         self.setup_tap()
         self._add_initial_peers()
 
-        # Create UDP socket. SO_REUSEPORT есть только на Linux/BSD —
-        # используем его чтобы занять порт сразу после STUN-сокета без
-        # ожидания TIME_WAIT. На Windows flag не поддерживается asyncio,
-        # но там достаточно того, что STUN-сокет уже закрыт.
-        endpoint_kwargs = dict(
-            local_addr=("0.0.0.0", self.cfg["listen_port"]),
-        )
-        import sys as _sys
-        if _sys.platform != "win32":
-            endpoint_kwargs["reuse_port"] = True
+        # UDP-сокет создаём вручную, чтобы выставить SO_REUSEADDR
+        # (+ SO_REUSEPORT на Linux). Это лечит WSAEADDRINUSE на Windows
+        # после закрытия STUN-сокета: asyncio.transport.close() освобождает
+        # порт асинхронно, и без REUSEADDR следующий bind() падает.
         transport, _ = await self._loop.create_datagram_endpoint(
             lambda: self._UDPProtocol(self),
-            **endpoint_kwargs,
+            sock=_make_udp_socket(self.cfg["listen_port"]),
         )
 
         # Send initial HELLO to bootstrap peers
