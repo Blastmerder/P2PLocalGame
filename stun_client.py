@@ -224,6 +224,12 @@ async def discover_async(
             # Без REUSEADDR на Windows VPN-сокет потом не сможет забиндиться
             # на тот же порт — asyncio.transport.close() освобождает порт
             # асинхронно, bind() ловит WSAEADDRINUSE.
+            #
+            # ВАЖНО: НЕ делаем sock.connect(server_addr). На Windows
+            # ProactorEventLoop в Python 3.14 при connected-сокете
+            # transport.sendto(data) уходит в WSASendTo с addr=None
+            # и падает ("argument 4 must be tuple, not None"). Передаём
+            # адрес явно в transport.sendto(request, server_addr).
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if hasattr(socket, "SO_REUSEPORT"):
@@ -233,14 +239,13 @@ async def discover_async(
                     pass
             sock.setblocking(False)
             sock.bind(("0.0.0.0", local_port))
-            sock.connect(server_addr)
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: _STUNProtocol(txn_id, fut),
                 sock=sock,
             )
 
             try:
-                transport.sendto(request)
+                transport.sendto(request, server_addr)
                 ip, pub_port = await asyncio.wait_for(fut, timeout=timeout)
                 log.info("STUN success via %s → %s:%d", label, ip, pub_port)
                 return STUNResult(
