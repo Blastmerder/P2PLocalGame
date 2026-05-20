@@ -110,13 +110,23 @@ def _parse_response(data: bytes, txn_id: bytes) -> Optional[tuple[str, int]]:
         # выравнивание по 4 байтам
         if attr_len % 4:
             offset += 4 - (attr_len % 4)
+        
+        if len(attr_val) < 8:
+            continue
+        
+        match len(attr_val):
+            case ATTR_XOR_MAPPED_ADDRESS:
+                xor_result = _parse_xor_mapped(attr_val)
+            case ATTR_MAPPED_ADDRESS:
+                mapped_result = _parse_mapped(attr_val)
 
-        if attr_type == ATTR_XOR_MAPPED_ADDRESS and len(attr_val) >= 8:
-            xor_result = _parse_xor_mapped(attr_val)
-
-        elif attr_type == ATTR_MAPPED_ADDRESS and len(attr_val) >= 8:
-            mapped_result = _parse_mapped(attr_val)
-
+#
+#        if attr_type == ATTR_XOR_MAPPED_ADDRESS and len(attr_val) >= 8:
+#            xor_result = _parse_xor_mapped(attr_val)
+#
+#        elif attr_type == ATTR_MAPPED_ADDRESS and len(attr_val) >= 8:
+#            mapped_result = _parse_mapped(attr_val)
+#
     # XOR-MAPPED-ADDRESS предпочтительнее (RFC 5389 рекомендует)
     return xor_result or mapped_result
 
