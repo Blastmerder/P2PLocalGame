@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from tap import TAPDevice
+from peer import Peer
+from constants import *
 
 
 def _make_udp_socket(port: int) -> socket.socket:
@@ -37,28 +39,6 @@ def _make_udp_socket(port: int) -> socket.socket:
     sock.bind(("0.0.0.0", port))
     return sock
 
-# ──────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────
-ETH_PROTO_ARP = 0x0806
-
-MAGIC       = b"P2PL2"  # 5-byte header prefix to identify our packets
-MAGIC_LEN   = len(MAGIC)
-HEARTBEAT_INTERVAL  = 5   # seconds between regular keepalive pings
-PEER_TIMEOUT        = 30  # seconds before a peer is considered dead
-PUNCH_COUNT         = 10  # rapid HELLOs at startup for hole punching
-PUNCH_INTERVAL      = 0.3 # seconds between punch packets
-
-# ── MTU budget ────────────────────────────────────────────────
-# Physical MTU 1500
-#  - IP header   20
-#  - UDP header   8
-#  - MAGIC+TYPE   6
-#  - PPPoE/ISP   46  (safety margin)
-# ─────────────────
-# TAP MTU       1420  → Ethernet frames never exceed physical MTU,
-#                       NAT routers won't fragment/drop UDP datagrams
-TAP_MTU = 1420
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,13 +103,10 @@ class Peer:
 TYPE_DATA  = 0x01
 TYPE_HELLO = 0x02
 
+HELLO = MAGIC + bytes([TYPE_HELLO])
 
 def encode_data(frame: bytes) -> bytes:
     return MAGIC + bytes([TYPE_DATA]) + frame
-
-
-def encode_hello() -> bytes:
-    return MAGIC + bytes([TYPE_HELLO])
 
 
 def decode(packet: bytes):
@@ -141,54 +118,56 @@ def decode(packet: bytes):
     return ptype, payload
 
 
+# ─────────────────────────────────────────────────────
+# UDP protocol
+# ────────────────────────────────────────────────────────────
+class UDPProtocol(asyncio.DatagramProtocol):
+    def __init__(self, node):
+        self.node = node
+
+    def connection_made(self, transport):
+        self.node._transport = transport
+        log.info("UDP socket ready on port %d", self.node.cfg["listen_port"])
+
+    def datagram_received(self, data, addr):
+        self.node._on_udp(data, addr)
+
+    def error_received(self, exc):
+        log.warning("UDP error: %s", exc)
+
+
 # ──────────────────────────────────────────────────────────────
 # Main VPN node
 # ──────────────────────────────────────────────────────────────
 class VPNNode:
-    def __init__(self, config):
+    def __init__(self, config, tap):
         self.cfg = config
         self.peers: Dict[tuple, Peer] = {}   # (host, port) → Peer
         self._tap = None                     # tap.TAPDevice
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._tap = tap
 
     # ── Setup ────────────────────────────────────────────────
 
-    def setup_tap(self):
-        self._tap = TAPDevice(
-            name=self.cfg.get("tap_name", "tap0"),
-            ip=self.cfg["local_ip"],
-            prefix=self.cfg.get("prefix", 24),
-            mtu=self.cfg.get("mtu", TAP_MTU),
-        )
-        self._tap.setup()
-
-    def teardown_tap(self):
-        if self._tap is not None:
-            self._tap.teardown()
+#    def setup_tap(self):
+#        self._tap = TAPDevice(
+#            name=self.cfg.get("tap_name", "tap0"),
+#            ip=self.cfg["local_ip"],
+#            prefix=self.cfg.get("prefix", 24),
+#            mtu=self.cfg.get("mtu", TAP_MTU),
+#        )
+#        self._tap.setup()
+    
+    def add_peer(self, peer: Peer):
+        addr = peer.addr
+        self.peers[addr] = peer
+        log.info("Registered initial peer: %s:%d", addr[0], addr[1])
 
     def _add_initial_peers(self):
         for hp in self.cfg.get("peers", []):
             host, port = hp["host"], hp["port"]
-            key = (host, port)
-            self.peers[key] = Peer(host=host, port=port)
-            log.info("Registered initial peer: %s:%d", host, port)
-
-    # ── UDP protocol ─────────────────────────────────────────
-
-    class _UDPProtocol(asyncio.DatagramProtocol):
-        def __init__(self, node):
-            self.node = node
-
-        def connection_made(self, transport):
-            self.node._transport = transport
-            log.info("UDP socket ready on port %d", self.node.cfg["listen_port"])
-
-        def datagram_received(self, data, addr):
-            self.node._on_udp(data, addr)
-
-        def error_received(self, exc):
-            log.warning("UDP error: %s", exc)
+            self.add_peer(Peer(host=host, port=port))
 
     # ── Core event handlers ──────────────────────────────────
 
@@ -203,11 +182,10 @@ class VPNNode:
             log.info("New peer discovered: %s:%d", *addr)
             self.peers[addr] = Peer(host=addr[0], port=addr[1])
 
-        peer = self.peers[addr]
-        peer.touch()
+        self.peers[addr].touch()
 
         if ptype == TYPE_DATA:
-            self._write_tap(payload)
+            self._tap.write(payload)
             # Learn MAC from Ethernet src field (bytes 6-12)
             if len(payload) >= 12 and peer.mac is None:
                 peer.mac = payload[6:12]
@@ -216,9 +194,6 @@ class VPNNode:
         elif ptype == TYPE_HELLO:
             log.debug("HELLO from %s:%d", *addr)
 
-    def _write_tap(self, frame: bytes):
-        """Записать Ethernet-фрейм в TAP (через платформенный backend)."""
-        self._tap.write(frame)
 
     def _on_tap_frame(self, frame: bytes):
         """Callback из TAP: один готовый Ethernet-фрейм → всем пирам."""
@@ -244,11 +219,6 @@ class VPNNode:
         for key in to_remove:
             log.info("Peer timed out, removing: %s", self.peers.pop(key))
 
-    # ── Unicast helper (for future use / routing) ────────────
-    def send_to(self, frame: bytes, addr: tuple):
-        if self._transport and addr in self.peers:
-            self._transport.sendto(encode_data(frame), addr)
-
     # ── Hole punching ────────────────────────────────────────────
 
     async def _hole_punch_all(self):
@@ -264,15 +234,16 @@ class VPNNode:
         """
         if not self.peers:
             return
-        hello = encode_hello()
+
         log.info("Starting hole punch for %d peer(s)…", len(self.peers))
+        
+        # Начинаем отправлять всем HELLO, потому что надо для создания открытого порта на роутере
         for i in range(PUNCH_COUNT):
-            for peer in list(self.peers.values()):
-                if self._transport:
-                    self._transport.sendto(hello, peer.addr)
-                    log.debug("Punch #%d → %s", i + 1, peer.addr)
+            self.send_to_peers(HELLO)
             await asyncio.sleep(PUNCH_INTERVAL)
+        
         confirmed = [p for p in self.peers.values() if p.confirmed]
+        
         if confirmed:
             log.info("Hole punch OK: %d/%d peers responded",
                      len(confirmed), len(self.peers))
@@ -281,16 +252,21 @@ class VPNNode:
                 "Hole punch: no peers responded after %d attempts. "
                 "Check address, firewall, and NAT type.", PUNCH_COUNT)
 
-    # ── Heartbeat ────────────────────────────────────────────
+    # ── Send Data to All Peers ───────────────────────────────
+    
+    def send_to_peers(self, data):
+        for peer in list(self.peers.values()):
+            if self._transport:
+                self._transport.sendto(data, peer.addr)    
+                log.debug("Send to %s, data, %s", peer.addr, data)
+
+    # ── HeartBeat ──────────────────────────────────────────── 
 
     async def _heartbeat(self):
         """Periodically send HELLO to all known peers to keep them alive."""
-        hello = encode_hello()
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            for peer in list(self.peers.values()):
-                if self._transport:
-                    self._transport.sendto(hello, peer.addr)
+            self.send_to_peers(HELLO)
             self._log_peers()
 
     def _log_peers(self):
@@ -298,34 +274,36 @@ class VPNNode:
         alive   = sum(1 for p in peers if p.is_alive())
         pending = sum(1 for p in peers if not p.confirmed)
         dead    = len(peers) - alive - pending
+        
         log.info(
             "Peers — alive: %d  pending: %d  dead: %d  total: %d",
             alive, pending, dead, len(peers),
         )
+        
         for p in peers:
             log.info("  %s", p)
 
     # ── Entry point ──────────────────────────────────────────
 
     async def run(self):
+        # todo: Обновить запуск, без каких либо зовисимостей, либо с выдачей зависимостей при запуске и их переиспользование, для упращения процесса  
+
         self._loop = asyncio.get_running_loop()
-        self.setup_tap()
         self._add_initial_peers()
 
         # UDP-сокет создаём вручную, чтобы выставить SO_REUSEADDR
         # (+ SO_REUSEPORT на Linux). Это лечит WSAEADDRINUSE на Windows
         # после закрытия STUN-сокета: asyncio.transport.close() освобождает
         # порт асинхронно, и без REUSEADDR следующий bind() падает.
-        transport, _ = await self._loop.create_datagram_endpoint(
-            lambda: self._UDPProtocol(self),
+        self._transport, _ = await self._loop.create_datagram_endpoint(
+            lambda: UDPProtocol(self),
             sock=_make_udp_socket(self.cfg["listen_port"]),
         )
 
         # Send initial HELLO to bootstrap peers
         await asyncio.sleep(0.2)
-        hello = encode_hello()
-        for peer in self.peers.values():
-            transport.sendto(hello, peer.addr)
+        
+        self.send_to_peers(HELLO)
 
         log.info("VPN node started. Local IP: %s  Port: %d",
                  self.cfg["local_ip"], self.cfg["listen_port"])
@@ -339,4 +317,4 @@ class VPNNode:
                 self._heartbeat(),
             )
         finally:
-            self.teardown_tap()
+            pass

@@ -27,12 +27,14 @@ from typing import Optional
 
 from vpn_node import VPNNode
 from stun_client import discover_async, STUNResult
-from tap import is_admin
+from tap import is_admin, TAPDevice
+from constants import *
 
 log = logging.getLogger("vpn.main")
 
 logging.basicConfig(
-    level=logging.INFO,
+    filename='logs.log',
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -125,8 +127,13 @@ async def main_async(cfg: dict):
     print( "  ╚══════════════════════════════════════╝\n")
     if stun:
         print(f"  ► Share this address with peers:  {stun.public_ip}:{stun.public_port}\n")
-
-    node = VPNNode(cfg)
+    tap = TAPDevice(
+            name=cfg.get("tap_name", "tap0"),
+            ip=cfg["local_ip"],
+            prefix=cfg.get("prefix", 24),
+            mtu=cfg.get("mtu", TAP_MTU),
+        )
+    node = VPNNode(cfg, tap)
 
     loop = asyncio.get_running_loop()
 
@@ -143,7 +150,9 @@ async def main_async(cfg: dict):
         loop.add_signal_handler(signal.SIGTERM, _shutdown)
 
     try:
+        tap.setup()
         await node.run()
+        
     except asyncio.CancelledError:
         log.info("Node stopped.")
 
