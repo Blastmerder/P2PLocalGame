@@ -17,27 +17,8 @@ from typing import Dict, Optional
 from tap import TAPDevice
 from peer import Peer
 from constants import *
-
-
-def _make_udp_socket(port: int) -> socket.socket:
-    """
-    Создать UDP-сокет, готовый к биндингу на 0.0.0.0:port.
-
-    SO_REUSEADDR обязательно — на Windows без него bind() падает
-    с WSAEADDRINUSE если STUN-сокет ещё не до конца закрыт.
-    SO_REUSEPORT — где доступно (Linux/BSD), позволяет нескольким
-    сокетам слушать тот же порт одновременно.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, "SO_REUSEPORT"):
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except (AttributeError, OSError):
-            pass
-    sock.setblocking(False)
-    sock.bind(("0.0.0.0", port))
-    return sock
+from UDP_Protocol import UDPProtocol
+from MakeSocket import _make_udp_socket 
 
 
 logging.basicConfig(
@@ -48,51 +29,7 @@ logging.basicConfig(
 log = logging.getLogger("vpn")
 
 
-# ──────────────────────────────────────────────────────────────
-# Peer state
-# ──────────────────────────────────────────────────────────────
-@dataclass
-class Peer:
-    host: str
-    port: int
-    # 0.0 = "никогда не отвечал" (пир из конфига, непроверенный)
-    last_seen: float = 0.0
-    mac: Optional[bytes] = None
-
-    @property
-    def addr(self):
-        return (self.host, self.port)
-
-    @property
-    def confirmed(self) -> bool:
-        """True если пир хотя бы раз прислал пакет."""
-        return self.last_seen > 0.0
-
-    def touch(self):
-        self.last_seen = time.time()
-
-    def is_alive(self) -> bool:
-        """
-        Живым считается только подтверждённый пир, от которого
-        пришёл пакет не позже PEER_TIMEOUT секунд назад.
-        Непроверенные пиры из конфига — статус 'pending', не alive.
-        """
-        if not self.confirmed:
-            return False
-        return (time.time() - self.last_seen) < PEER_TIMEOUT
-
-    @property
-    def status(self) -> str:
-        if not self.confirmed:
-            return "pending"
-        return "alive" if self.is_alive() else "dead"
-
-    def __str__(self):
-        mac_str = ":".join(f"{b:02x}" for b in self.mac) if self.mac else "unknown"
-        return f"{self.host}:{self.port} [{self.status}] mac={mac_str}"
-
-
-# ──────────────────────────────────────────────────────────────
+# ───────────────────────────────────────
 # Packet wire format
 #
 #   [ MAGIC (5) | TYPE (1) | PAYLOAD ]
@@ -104,6 +41,7 @@ TYPE_DATA  = 0x01
 TYPE_HELLO = 0x02
 
 HELLO = MAGIC + bytes([TYPE_HELLO])
+
 
 def encode_data(frame: bytes) -> bytes:
     return MAGIC + bytes([TYPE_DATA]) + frame
@@ -118,24 +56,6 @@ def decode(packet: bytes):
     return ptype, payload
 
 
-# ─────────────────────────────────────────────────────
-# UDP protocol
-# ────────────────────────────────────────────────────────────
-class UDPProtocol(asyncio.DatagramProtocol):
-    def __init__(self, node):
-        self.node = node
-
-    def connection_made(self, transport):
-        self.node._transport = transport
-        log.info("UDP socket ready on port %d", self.node.cfg["listen_port"])
-
-    def datagram_received(self, data, addr):
-        self.node._on_udp(data, addr)
-
-    def error_received(self, exc):
-        log.warning("UDP error: %s", exc)
-
-
 # ──────────────────────────────────────────────────────────────
 # Main VPN node
 # ──────────────────────────────────────────────────────────────
@@ -147,22 +67,16 @@ class VPNNode:
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tap = tap
-
-    # ── Setup ────────────────────────────────────────────────
-
-#    def setup_tap(self):
-#        self._tap = TAPDevice(
-#            name=self.cfg.get("tap_name", "tap0"),
-#            ip=self.cfg["local_ip"],
-#            prefix=self.cfg.get("prefix", 24),
-#            mtu=self.cfg.get("mtu", TAP_MTU),
-#        )
-#        self._tap.setup()
+   
     
+    def get_peers(self):
+        return self.peers
+
     def add_peer(self, peer: Peer):
         addr = peer.addr
         self.peers[addr] = peer
         log.info("Registered initial peer: %s:%d", addr[0], addr[1])
+
 
     def _add_initial_peers(self):
         for hp in self.cfg.get("peers", []):
@@ -186,10 +100,6 @@ class VPNNode:
 
         if ptype == TYPE_DATA:
             self._tap.write(payload)
-            # Learn MAC from Ethernet src field (bytes 6-12)
-            if len(payload) >= 12 and peer.mac is None:
-                peer.mac = payload[6:12]
-                log.info("Learned MAC for %s: %s", addr, peer)
 
         elif ptype == TYPE_HELLO:
             log.debug("HELLO from %s:%d", *addr)
@@ -222,16 +132,6 @@ class VPNNode:
     # ── Hole punching ────────────────────────────────────────────
 
     async def _hole_punch_all(self):
-        """
-        UDP Hole Punching без relay-сервера.
-
-        Оба клиента одновременно шлют HELLO на публичный адрес друг друга.
-        Первый исходящий пакет открывает «дырку» в NAT: маршрутизатор
-        запоминает маппинг (src, dst) и начинает пропускать ответы.
-
-        Работает для: Full Cone, Address-Restricted, Port-Restricted NAT.
-        Для Symmetric NAT — не гарантировано (редко у домашних провайдеров).
-        """
         if not self.peers:
             return
 

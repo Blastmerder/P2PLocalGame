@@ -1,5 +1,8 @@
 from typing import Dict, Optional
 from dataclasses import dataclass
+import time
+
+from constants import *
 
 # ──────────────────────────────────────────────────────────────
 # Peer state
@@ -43,6 +46,4 @@ class Peer:
     def __str__(self):
         mac_str = ":".join(f"{b:02x}" for b in self.mac) if self.mac else "unknown"
         return f"{self.host}:{self.port} [{self.status}] mac={mac_str}"
-
-
 

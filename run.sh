@@ -10,8 +10,8 @@ HOST_IP="10.200.1.1"
 NS_IP="10.200.1.2"
 TABLE_ID=200
 TABLE_NAME="novpn"
-EXT_IF="wlan0"                # внешний интерфейс
-EXT_GW="192.168.1.1"          # шлюз
+EXT_IF=$1                # внешний интерфейс
+EXT_GW=$(ip route show dev "$EXT_IF" | grep default | awk '{print $3}' | head -n 1)          # шлюз
 GAME_CMD="/path/to/game"      # путь к игре
 # ------------------------------------------------
 
