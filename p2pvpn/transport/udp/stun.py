@@ -1,13 +1,8 @@
 """
-stun_client.py — минимальный STUN-клиент (RFC 5389)
+stun.py — STUN (Session Traversal Utilities for NAT) implementation.
 
-Определяет публичный IP и порт узла путём отправки Binding Request
-на публичные STUN-серверы. Никаких внешних зависимостей.
-
-Поддерживает:
-  • Несколько fallback-серверов (опрашиваются по очереди)
-  • Async и sync интерфейс
-  • Разбор атрибутов MAPPED-ADDRESS и XOR-MAPPED-ADDRESS
+Provides functionality to discover a node's public IP address and port
+by communicating with STUN servers.
 """
 
 import asyncio
@@ -20,10 +15,10 @@ import struct
 from dataclasses import dataclass
 from typing import Optional
 
-log = logging.getLogger("vpn.stun")
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────
-# Публичные STUN-серверы (fallback-список)
+# Public STUN servers (fallback list)
 # ──────────────────────────────────────────────────────────────
 DEFAULT_SERVERS: list[tuple[str, int]] = [
     ("stun.l.google.com",       19302),
@@ -36,9 +31,9 @@ DEFAULT_SERVERS: list[tuple[str, int]] = [
 ]
 
 # ──────────────────────────────────────────────────────────────
-# RFC 5389 константы
+# RFC 5389 constants
 # ──────────────────────────────────────────────────────────────
-STUN_MAGIC_COOKIE    = 0x2112A442          # фиксированное магическое число
+STUN_MAGIC_COOKIE    = 0x2112A442          # fixed magic cookie
 BINDING_REQUEST      = 0x0001
 BINDING_RESPONSE     = 0x0101
 BINDING_ERROR        = 0x0111
@@ -46,11 +41,11 @@ BINDING_ERROR        = 0x0111
 ATTR_MAPPED_ADDRESS     = 0x0001
 ATTR_XOR_MAPPED_ADDRESS = 0x0020
 
-HEADER_SIZE = 20   # байт: type(2) + length(2) + cookie(4) + txn_id(12)
+HEADER_SIZE = 20   # bytes: type(2) + length(2) + cookie(4) + txn_id(12)
 
 
 # ──────────────────────────────────────────────────────────────
-# Результат STUN-запроса
+# STUN request result
 # ──────────────────────────────────────────────────────────────
 @dataclass
 class STUNResult:
@@ -63,10 +58,10 @@ class STUNResult:
 
 
 # ──────────────────────────────────────────────────────────────
-# Сборка / разбор STUN-пакетов
+# STUN packet assembly/parsing
 # ──────────────────────────────────────────────────────────────
 def _build_binding_request() -> tuple[bytes, bytes]:
-    """Вернуть (пакет, transaction_id)."""
+    """Return (packet, transaction_id)."""
     txn_id = os.urandom(12)
     # Header: msg_type(2) + msg_len(2) + magic(4) + txn_id(12)
     header = struct.pack(">HHI", BINDING_REQUEST, 0, STUN_MAGIC_COOKIE) + txn_id
@@ -75,30 +70,30 @@ def _build_binding_request() -> tuple[bytes, bytes]:
 
 def _parse_response(data: bytes, txn_id: bytes) -> Optional[tuple[str, int]]:
     """
-    Разобрать STUN Binding Response.
-    Возвращает (ip, port) или None при ошибке.
+    Parse STUN Binding Response.
+    Returns (ip, port) or None on failure.
     """
     if len(data) < HEADER_SIZE:
-        log.debug("STUN response too short: %d bytes", len(data))
+        logger.debug("STUN response too short: %d bytes", len(data))
         return None
 
     msg_type, msg_len, magic = struct.unpack(">HHI", data[:8])
     resp_txn = data[8:20]
 
     if msg_type == BINDING_ERROR:
-        log.debug("STUN server returned error response")
+        logger.debug("STUN server returned error response")
         return None
     if msg_type != BINDING_RESPONSE:
-        log.debug("Unexpected STUN message type: 0x%04x", msg_type)
+        logger.debug("Unexpected STUN message type: 0x%04x", msg_type)
         return None
     if magic != STUN_MAGIC_COOKIE:
-        log.debug("STUN magic cookie mismatch")
+        logger.debug("STUN magic cookie mismatch")
         return None
     if resp_txn != txn_id:
-        log.debug("STUN transaction ID mismatch")
+        logger.debug("STUN transaction ID mismatch")
         return None
 
-    # Разобрать атрибуты
+    # Parse attributes
     offset = HEADER_SIZE
     xor_result    = None
     mapped_result = None
@@ -107,7 +102,7 @@ def _parse_response(data: bytes, txn_id: bytes) -> Optional[tuple[str, int]]:
         attr_type, attr_len = struct.unpack(">HH", data[offset:offset + 4])
         attr_val = data[offset + 4: offset + 4 + attr_len]
         offset += 4 + attr_len
-        # выравнивание по 4 байтам
+        # alignment to 4 bytes
         if attr_len % 4:
             offset += 4 - (attr_len % 4)
 
@@ -117,12 +112,12 @@ def _parse_response(data: bytes, txn_id: bytes) -> Optional[tuple[str, int]]:
         elif attr_type == ATTR_MAPPED_ADDRESS and len(attr_val) >= 8:
             mapped_result = _parse_mapped(attr_val)
 
-    # XOR-MAPPED-ADDRESS предпочтительнее (RFC 5389 рекомендует)
+    # XOR-MAPPED-ADDRESS preferred (RFC 5389 recommends)
     return xor_result or mapped_result
 
 
 def _parse_xor_mapped(val: bytes) -> Optional[tuple[str, int]]:
-    """Разобрать XOR-MAPPED-ADDRESS атрибут."""
+    """Parse XOR-MAPPED-ADDRESS attribute."""
     family = val[1]
     xport  = struct.unpack(">H", val[2:4])[0] ^ (STUN_MAGIC_COOKIE >> 16)
 
@@ -131,15 +126,15 @@ def _parse_xor_mapped(val: bytes) -> Optional[tuple[str, int]]:
         ip  = str(ipaddress.IPv4Address(xip))
         return ip, xport
 
-    if family == 0x02:  # IPv6 (на будущее)
-        log.debug("IPv6 XOR-MAPPED-ADDRESS — not yet handled")
+    if family == 0x02:  # IPv6 (future use)
+        logger.debug("IPv6 XOR-MAPPED-ADDRESS — not yet handled")
         return None
 
     return None
 
 
 def _parse_mapped(val: bytes) -> Optional[tuple[str, int]]:
-    """Разобрать MAPPED-ADDRESS атрибут (старый формат)."""
+    """Parse MAPPED-ADDRESS attribute (legacy format)."""
     family = val[1]
     port   = struct.unpack(">H", val[2:4])[0]
 
@@ -151,7 +146,7 @@ def _parse_mapped(val: bytes) -> Optional[tuple[str, int]]:
 
 
 # ──────────────────────────────────────────────────────────────
-# Async UDP протокол для asyncio
+# Async UDP protocol for asyncio
 # ──────────────────────────────────────────────────────────────
 class _STUNProtocol(asyncio.DatagramProtocol):
     def __init__(self, txn_id: bytes, future: asyncio.Future):
@@ -177,7 +172,7 @@ class _STUNProtocol(asyncio.DatagramProtocol):
 
 
 # ──────────────────────────────────────────────────────────────
-# Основная async функция
+# Main async function
 # ──────────────────────────────────────────────────────────────
 async def discover_async(
     servers: Optional[list[tuple[str, int]]] = None,
@@ -185,15 +180,15 @@ async def discover_async(
     local_port: int = 0,
 ) -> STUNResult:
     """
-    Определить публичный IP:port через STUN.
+    Determine public IP:port via STUN.
 
-    Параметры
-    ---------
-    servers     : список (host, port) STUN-серверов; по умолчанию DEFAULT_SERVERS
-    timeout     : таймаут на один сервер (секунды)
-    local_port  : локальный UDP-порт (0 = выбрать автоматически)
+    Args:
+        servers: list of (host, port) STUN servers; defaults to DEFAULT_SERVERS
+        timeout: timeout per server (seconds)
+        local_port: local UDP port (0 = auto-allocate)
 
-    Возвращает STUNResult или бросает RuntimeError если все серверы недоступны.
+    Returns:
+        STUNResult or raises RuntimeError if all servers are unreachable.
     """
     if servers is None:
         servers = DEFAULT_SERVERS
@@ -204,9 +199,9 @@ async def discover_async(
     for host, port in servers:
         label = f"{host}:{port}"
         try:
-            log.debug("Trying STUN server %s …", label)
+            logger.debug("Trying STUN server %s …", label)
 
-            # Резолвим хост заранее (чтобы поймать DNS-ошибки красиво)
+            # Resolve host beforehand (to catch DNS errors gracefully)
             infos = await loop.getaddrinfo(
                 host, port,
                 type=socket.SOCK_DGRAM,
@@ -215,21 +210,21 @@ async def discover_async(
             if not infos:
                 raise OSError(f"DNS lookup failed for {host}")
 
-            server_addr = (infos[0][4][0], port)   # первый IPv4 адрес
+            server_addr = (infos[0][4][0], port)   # first IPv4 address
 
             request, txn_id = _build_binding_request()
             fut: asyncio.Future = loop.create_future()
 
-            # Поднимаем сокет вручную с SO_REUSEADDR (+ REUSEPORT где есть).
-            # Без REUSEADDR на Windows VPN-сокет потом не сможет забиндиться
-            # на тот же порт — asyncio.transport.close() освобождает порт
-            # асинхронно, bind() ловит WSAEADDRINUSE.
-            #
-            # ВАЖНО: НЕ делаем sock.connect(server_addr). На Windows
-            # ProactorEventLoop в Python 3.14 при connected-сокете
-            # transport.sendto(data) уходит в WSASendTo с addr=None
-            # и падает ("argument 4 must be tuple, not None"). Передаём
-            # адрес явно в transport.sendto(request, server_addr).
+            # Bind socket manually with SO_REUSEADDR (+ REUSEPORT if available).
+            # Without SO_REUSEADDR on Windows, the VPN socket might fail to 
+            # bind to the same port after asyncio.transport.close() due to 
+            # TIME_WAIT / asynchronous closing.
+            # 
+            # IMPORTANT: DO NOT use sock.connect(server_addr). On Windows
+            # ProactorEventLoop in Python 3.14, if the socket is connected,
+            # transport.sendto(data) uses WSASendTo with addr=None
+            # and fails ("argument 4 must be tuple, not None"). 
+            # Pass address explicitly to transport.sendto(request, server_addr).
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if hasattr(socket, "SO_REUSEPORT"):
@@ -247,7 +242,7 @@ async def discover_async(
             try:
                 transport.sendto(request, server_addr)
                 ip, pub_port = await asyncio.wait_for(fut, timeout=timeout)
-                log.info("STUN success via %s → %s:%d", label, ip, pub_port)
+                logger.info("STUN success via %s → %s:%d", label, ip, pub_port)
                 return STUNResult(
                     public_ip=ip,
                     public_port=pub_port,
@@ -257,10 +252,10 @@ async def discover_async(
                 transport.close()
 
         except asyncio.TimeoutError:
-            log.debug("STUN timeout on %s", label)
+            logger.debug("STUN timeout on %s", label)
             last_error = TimeoutError(f"STUN server {label} timed out")
         except Exception as exc:
-            log.debug("STUN error on %s: %s", label, exc)
+            logger.debug("STUN error on %s: %s", label, exc)
             last_error = exc
 
     raise RuntimeError(
@@ -269,54 +264,12 @@ async def discover_async(
 
 
 # ──────────────────────────────────────────────────────────────
-# Sync-обёртка (удобна для одиночного вызова без asyncio)
+# Sync wrapper (useful for single calls without explicit loop management)
 # ──────────────────────────────────────────────────────────────
 def discover(
     servers: Optional[list[tuple[str, int]]] = None,
     timeout: float = 3.0,
     local_port: int = 0,
 ) -> STUNResult:
-    """Синхронная версия discover_async. Создаёт временный event loop."""
+    """Synchronous version of discover_async. Manages its own event loop."""
     return asyncio.run(discover_async(servers, timeout, local_port))
-
-
-# ──────────────────────────────────────────────────────────────
-# CLI: python3 stun_client.py
-# ──────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import argparse
-    import sys
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    parser = argparse.ArgumentParser(description="STUN public IP discovery")
-    parser.add_argument("--server", metavar="HOST:PORT", action="append",
-                        help="STUN server (repeat for multiple). Default: Google/Cloudflare")
-    parser.add_argument("--timeout", type=float, default=3.0,
-                        help="Per-server timeout in seconds (default: 3)")
-    parser.add_argument("--port", type=int, default=0,
-                        help="Local UDP port to bind (default: auto)")
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    servers = None
-    if args.server:
-        servers = []
-        for s in args.server:
-            h, p = s.rsplit(":", 1)
-            servers.append((h, int(p)))
-
-    try:
-        result = discover(servers=servers, timeout=args.timeout, local_port=args.port)
-        print(f"\n  ✓ Public address : {result.public_ip}:{result.public_port}")
-        print(f"  ✓ STUN server    : {result.server_used}\n")
-    except RuntimeError as e:
-        print(f"\n  ✗ STUN failed: {e}\n", file=sys.stderr)
-        sys.exit(1)
